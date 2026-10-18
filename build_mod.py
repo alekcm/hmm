@@ -31,7 +31,12 @@ from PIL import Image
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(ROOT, "Текстуры")
+OUT_H5U = os.path.join(ROOT, "CreatureTextures_H5_3.1.h5u")
 OUT_PAK = os.path.join(ROOT, "zz_CreatureTextures_H5_3.1.pak")
+# ВАЖНО: HoMM5 при одинаковых путях в разных архивах берёт файл с САМОЙ НОВОЙ
+# датой внутри архива. У оригиналов data.pak даты 2007 года, поэтому все записи
+# мода датируем заведомо позже, иначе игра молча возьмёт оригинальные текстуры.
+ENTRY_DATE = (2026, 10, 19, 12, 0, 0)
 
 # ---------------------------------------------------------------------------
 # PNG из папки «Текстуры»  ->  игровые .dds, которые она заменяет.
@@ -169,25 +174,12 @@ def encode_color_block(px):
     return struct.pack("<HHI", c0, c1, bits)
 
 
-def encode_dds(rgba_img, fourcc, n_mips):
-    """PIL RGBA image -> DDS bytes в формате fourcc с n_mips уровнями."""
-    w, h = rgba_img.size
-    out = bytearray()
-    out += b"DDS "
-    out += struct.pack("<I", 124)          # dwSize
-    out += struct.pack("<I", 0x00021007)   # flags: CAPS|HEIGHT|WIDTH|PIXELFORMAT|MIPMAPCOUNT|LINEARSIZE
-    out += struct.pack("<II", h, w)
-    out += struct.pack("<I", max(1, w // 4) * max(1, h // 4) * (8 if fourcc == b"DXT1" else 16))
-    out += struct.pack("<I", 0)            # depth
-    out += struct.pack("<I", n_mips)
-    out += b"\x00" * 44                    # reserved
-    out += struct.pack("<I", 32)           # ddspf.dwSize
-    out += struct.pack("<I", 0x00000004)   # DDPF_FOURCC
-    out += fourcc
-    out += b"\x00" * 20                    # RGB bit count / masks (не используются при FOURCC)
-    out += struct.pack("<I", 0x00401008)   # caps: COMPLEX|MIPMAP|TEXTURE
-    out += b"\x00" * 16                    # caps2..reserved2
-
+def encode_dds(rgba_img, fourcc, n_mips, header128):
+    """PIL RGBA image -> DDS bytes. Заголовок (первые 128 байт) копируем из
+    оригинального файла игры один в один — движок привередлив к флагам,
+    а размер/формат/mip-число у нас и так совпадают с оригиналом."""
+    out = bytearray(header128)
+    assert out[:4] == b"DDS " and out[84:88] == fourcc
     img = rgba_img
     for level in range(n_mips):
         lw, lh = img.size
@@ -245,26 +237,58 @@ def open_data_pak():
     return zipfile.ZipFile(io.BytesIO(outer.read("data.pak")))
 
 
+def writestr_new(zout, arcname, data):
+    """Запись в архив с датой ENTRY_DATE (см. комментарий к ENTRY_DATE)."""
+    info = zipfile.ZipInfo(arcname, date_time=ENTRY_DATE)
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o644 << 16
+    zout.writestr(info, data)
+
+
+def build(pak):
+    """Возвращает dict {путь_в_архиве: байты} со всем содержимым мода."""
+    files = {}
+    for png_name, targets in MAPPING.items():
+        png_path = os.path.join(SRC_DIR, png_name)
+        new_rgb = Image.open(png_path).convert("RGB")
+        for target in targets:
+            orig_bytes = pak.read(target)
+            w, h, fourcc, n_mips = parse_dds_header(orig_bytes)
+            orig = Image.open(io.BytesIO(orig_bytes)).convert("RGBA")
+            # новая картинка в исходном разрешении + ОРИГИНАЛЬНАЯ альфа
+            resized = new_rgb.resize((w, h), Image.LANCZOS).convert("RGBA")
+            resized.putalpha(orig.getchannel("A"))
+            dds = encode_dds(resized, fourcc, n_mips, orig_bytes[:128])
+            # 1) текстура по её родному пути
+            files[target] = dds
+            # 2) Трюк из моддерского FAQ HoMM5: часть .dds игра «в лоб» не
+            #    подменяет. Поэтому кладём ту же текстуру под НОВЫМ именем и
+            #    переписываем ссылающийся на неё .(Texture).xdb (DestName).
+            folder, _, base = target.rpartition("/")
+            stem = base[:-4] if base.lower().endswith(".dds") else base
+            new_base = stem + ".h5mod.dds"
+            new_path = (folder + "/" if folder else "") + new_base
+            assert new_path not in pak.namelist(), f"имя занято: {new_path}"
+            files[new_path] = dds
+            xdb_path = target[:-4] + ".xdb"  # .dds -> .xdb, пара есть у всех
+            xdb = pak.read(xdb_path).decode("utf-8")
+            old_dest = f'<DestName href="{base}"/>'
+            assert old_dest in xdb, f"DestName не найден в {xdb_path}"
+            files[xdb_path] = xdb.replace(
+                old_dest, f'<DestName href="{new_base}"/>').encode("utf-8")
+            print(f"{png_name[:13]}… -> {w}x{h} {fourcc.decode()}  {target}")
+    return files
+
+
 def main():
     pak = open_data_pak()
-    written = []
-    with zipfile.ZipFile(OUT_PAK, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
-        for png_name, targets in MAPPING.items():
-            png_path = os.path.join(SRC_DIR, png_name)
-            new_rgb = Image.open(png_path).convert("RGB")
-            for target in targets:
-                orig_bytes = pak.read(target)
-                w, h, fourcc, n_mips = parse_dds_header(orig_bytes)
-                orig = Image.open(io.BytesIO(orig_bytes)).convert("RGBA")
-                # новая картинка в исходном разрешении + ОРИГИНАЛЬНАЯ альфа
-                resized = new_rgb.resize((w, h), Image.LANCZOS).convert("RGBA")
-                resized.putalpha(orig.getchannel("A"))
-                dds = encode_dds(resized, fourcc, n_mips)
-                zout.writestr(target, dds)
-                written.append((target, w, h, fourcc.decode(), len(dds)))
-                print(f"{png_name[:13]}… -> {w}x{h} {fourcc.decode()}  {target}")
-    print(f"\nГотово: {OUT_PAK}  ({len(written)} текстур, "
-          f"{os.path.getsize(OUT_PAK) / 1e6:.1f} МБ)")
+    files = build(pak)
+    for out in (OUT_H5U, OUT_PAK):
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zout:
+            for arcname, data in files.items():
+                writestr_new(zout, arcname, data)
+        print(f"\nГотово: {out}  ({len(files)} файлов, "
+              f"{os.path.getsize(out) / 1e6:.1f} МБ)")
 
 
 if __name__ == "__main__":
